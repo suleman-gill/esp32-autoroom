@@ -13,7 +13,7 @@
  *    (fallback keeps retrying your router in the background)
  *  - mDNS: http://autoroom.local
  *  - Renaming, per-appliance auto-off timers, scenes
- *  - Power-outage state restore (flash writes are batched to reduce wear)
+ *  - Per-relay power-outage state restore (one compact NVS state mask per change)
  *  - Optional password protection for the web app / API
  *
  * Board: "ESP32 Dev Module"   Libraries: only the built-in ESP32 core ones.
@@ -37,11 +37,20 @@
 const uint8_t RELAY_PINS[NUM_RELAYS]  = { 26, 27, 32, 33 };
 const uint8_t SWITCH_PINS[NUM_RELAYS] = { 18, 19, 21, 22 };
 
-#define RELAY_ACTIVE_LOW true      // most 4-ch relay boards: LOW = ON
+#define RELAY_ACTIVE_LOW true      // most 4-ch relay boards: LOW = ON (set false if Active HIGH)
 #define STATUS_LED 2
 
+// Power-on / Reboot Appliance Behavior:
+// 0 = RESTORE_LAST_STATE (Default: Remembers previous state; if OFF it stays OFF, if ON it stays ON)
+// 1 = ALWAYS_OFF         (Safe: All appliances start OFF after power cut)
+// 2 = ALWAYS_ON          (All appliances turn ON after power cut)
+#define BOOT_MODE_RESTORE    0
+#define BOOT_MODE_ALWAYS_OFF 1
+#define BOOT_MODE_ALWAYS_ON  2
+#define DEFAULT_BOOT_MODE    BOOT_MODE_RESTORE
+
 // Home Wi-Fi (2.4 GHz only - ESP32 cannot use 5 GHz)
-const char* DEFAULT_WIFI_SSID = "YOUR_WIFI_SSID";
+const char* DEFAULT_WIFI_SSID = "YOUR_WIFI_NAME";
 const char* DEFAULT_WIFI_PASS = "YOUR_WIFI_PASSWORD";
 
 // Fallback hotspot
@@ -55,11 +64,13 @@ const char* MDNS_HOST = "autoroom";        // http://autoroom.local
 #define WEB_USER "admin"
 const char* WEB_PASSWORD = "";
 
+// Set true if you have physical wall switches wired to GPIO 18, 19, 21, 22.
+// Set false if you only use the web app / phone (prevents floating pins from randomly toggling relays).
+#define ENABLE_PHYSICAL_SWITCHES true
+
 // Set true only if USB power causes brown-out reboot loops. Prefer a better 5V supply.
 #define DISABLE_BROWNOUT false
 
-#define SWITCH_DEBOUNCE_MS   40
-#define STATE_SAVE_DELAY_MS  1500     // batch flash writes
 #define WIFI_CONNECT_TIMEOUT 15000
 #define WIFI_RETRY_AP_MS     120000   // while in fallback AP, retry router every 2 min
 #define NAME_MAX_LEN         24
@@ -76,8 +87,7 @@ struct RelayChannel {
   bool     timerActive;
   uint32_t timerEnd;        // millis() deadline
   uint8_t  stableSw;        // debounced switch level
-  uint8_t  lastRawSw;
-  uint32_t lastSwChange;
+  uint8_t  swCounter;       // consecutive sample counter for EMI noise rejection
 };
 
 RelayChannel relays[NUM_RELAYS];
@@ -86,8 +96,8 @@ const char* DEFAULT_NAMES[NUM_RELAYS] = {
   "Main Light", "Ambient Light", "Bedside Light", "Ceiling Fan"
 };
 
-bool     stateDirty   = false;
-uint32_t stateDirtyAt = 0;
+uint8_t  bootMode     = DEFAULT_BOOT_MODE;
+bool     prefsReady   = false;
 bool     apMode       = false;
 bool     mdnsStarted  = false;
 uint32_t lastApRetry  = 0;
@@ -101,30 +111,37 @@ inline int relayLevel(bool on) {
   return (on != RELAY_ACTIVE_LOW) ? HIGH : LOW;   // active-low: on -> LOW
 }
 
+uint32_t relayStateMask() {
+  uint32_t mask = 0;
+  for (int i = 0; i < NUM_RELAYS; i++) {
+    if (relays[i].state) mask |= (1UL << i);
+  }
+  return mask;
+}
+
+bool persistRelayStates() {
+  if (!prefsReady) return false;
+  // A single Preferences value keeps the four channels' state together.
+  uint32_t expected = relayStateMask();
+  size_t written = prefs.putUInt("relay_mask", expected);
+  uint32_t verified = prefs.getUInt("relay_mask", 0xFFFFFFFFUL);
+  bool ok = (written == sizeof(uint32_t)) && (verified == expected);
+  if (!ok) Serial.printf("[NVS] ERROR: relay mask write/readback failed (expected 0x%08lX, read 0x%08lX)\n", (unsigned long)expected, (unsigned long)verified);
+  return ok;
+}
+
 void applyRelay(int i, bool on) {
   if (i < 0 || i >= NUM_RELAYS) return;
   if (relays[i].state != on) {
     relays[i].state = on;
     digitalWrite(RELAY_PINS[i], relayLevel(on));
-    stateDirty = true;
-    stateDirtyAt = millis();
-    Serial.printf("[Relay %d: %s] -> %s\n", i + 1, relays[i].name.c_str(), on ? "ON" : "OFF");
+    bool saved = persistRelayStates();
+    Serial.printf("[Relay %d: %s] -> %s (%s)\n", i + 1, relays[i].name.c_str(), on ? "ON" : "OFF", saved ? "saved" : "NOT SAVED");
   }
   if (!on) relays[i].timerActive = false;       // OFF always cancels the timer
 }
 
 void toggleRelay(int i) { applyRelay(i, !relays[i].state); }
-
-void flushStateIfNeeded() {
-  if (stateDirty && (millis() - stateDirtyAt) > STATE_SAVE_DELAY_MS) {
-    stateDirty = false;
-    for (int i = 0; i < NUM_RELAYS; i++) {
-      char key[16];
-      snprintf(key, sizeof(key), "state_%d", i);
-      prefs.putBool(key, relays[i].state);
-    }
-  }
-}
 
 String jsonEscape(const String& s) {
   String o;
@@ -179,6 +196,8 @@ void handleStatus() {
   j += sta ? "wifi" : "hotspot";
   j += "\",\"rssi\":";
   j += sta ? String(WiFi.RSSI()) : String(0);
+  j += ",\"bootMode\":";
+  j += bootMode;
   j += ",\"relays\":[";
 
   for (int i = 0; i < NUM_RELAYS; i++) {
@@ -215,6 +234,28 @@ void handleRelayControl() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleBootMode() {
+  REQUIRE_AUTH();
+  if (!prefsReady) { server.send(503, "text/plain", "Persistent storage unavailable"); return; }
+  if (!server.hasArg("mode")) {
+    server.send(400, "text/plain", "Missing mode");
+    return;
+  }
+  int m = server.arg("mode").toInt();
+  if (m < 0 || m > 2) {
+    server.send(400, "text/plain", "Invalid mode (0=Restore, 1=Off, 2=On)");
+    return;
+  }
+  bootMode = (uint8_t)m;
+  if (prefs.putUChar("boot_mode", bootMode) != sizeof(uint8_t)) {
+    server.send(500, "text/plain", "Could not save boot mode");
+    return;
+  }
+  Serial.printf("[Config] Boot mode set to: %d (%s)\n", bootMode,
+                bootMode == 0 ? "Restore Last State" : (bootMode == 1 ? "Always OFF" : "Always ON"));
+  server.send(200, "text/plain", "Boot mode saved");
+}
+
 void handleMasterControl() {
   REQUIRE_AUTH();
   if (!server.hasArg("action")) {
@@ -238,6 +279,7 @@ void handleMasterControl() {
 
 void handleRename() {
   REQUIRE_AUTH();
+  if (!prefsReady) { server.send(503, "text/plain", "Persistent storage unavailable"); return; }
   if (!server.hasArg("id") || !server.hasArg("name")) {
     server.send(400, "text/plain", "Missing arguments");
     return;
@@ -282,6 +324,7 @@ void handleTimer() {
 
 void handleWifiConfig() {
   REQUIRE_AUTH();
+  if (!prefsReady) { server.send(503, "text/plain", "Persistent storage unavailable"); return; }
   if (!server.hasArg("ssid")) {
     server.send(400, "text/plain", "Missing SSID");
     return;
@@ -296,9 +339,10 @@ void handleWifiConfig() {
   }
   prefs.putString("wifi_ssid", ssid);
   prefs.putString("wifi_pass", pass);
-  stateDirty = true;                 // make sure relay states are flushed before reboot
-  stateDirtyAt = 0;
-  flushStateIfNeeded();
+  if (!persistRelayStates()) {
+    server.send(500, "text/plain", "Could not save relay states");
+    return;
+  }
 
   server.send(200, "text/plain", "Saved. Restarting...");
   rebootAt = millis() + 1000;        // restart from loop(), after the reply is sent
@@ -312,17 +356,27 @@ void handleNotFound() {
 // INPUTS / TIMERS
 // ---------------------------------------------------------------------------------
 void checkPhysicalSwitches() {
+  if (!ENABLE_PHYSICAL_SWITCHES) return;
+  if (millis() < 2000) return;   // Prevent false triggers during power-on stabilization
+
+  static uint32_t lastSampleTime = 0;
   uint32_t now = millis();
+  if (now - lastSampleTime < 20) return;   // 20ms sample rate (spans 50Hz/60Hz AC period)
+  lastSampleTime = now;
+
   for (int i = 0; i < NUM_RELAYS; i++) {
     uint8_t raw = digitalRead(SWITCH_PINS[i]);
-    if (raw != relays[i].lastRawSw) {            // edge: restart debounce window
-      relays[i].lastRawSw = raw;
-      relays[i].lastSwChange = now;
-    }
-    if (raw != relays[i].stableSw && (now - relays[i].lastSwChange) >= SWITCH_DEBOUNCE_MS) {
-      relays[i].stableSw = raw;                  // signal held steady -> accept
-      toggleRelay(i);                            // any flip of a 2-way switch toggles
-      Serial.printf("[Switch %d] -> relay %s\n", i + 1, relays[i].state ? "ON" : "OFF");
+    if (raw != relays[i].stableSw) {
+      relays[i].swCounter++;
+      // Require 8 consecutive stable readings (~160ms) to confirm genuine switch flip
+      if (relays[i].swCounter >= 8) {
+        relays[i].stableSw = raw;
+        relays[i].swCounter = 0;
+        toggleRelay(i);
+        Serial.printf("[Switch %d] -> relay %s\n", i + 1, relays[i].state ? "ON" : "OFF");
+      }
+    } else {
+      relays[i].swCounter = 0;             // Reset on any noise glitch
     }
   }
 }
@@ -402,6 +456,14 @@ void maintainWifi() {
 // SETUP
 // ---------------------------------------------------------------------------------
 void setup() {
+  // Establish the inactive relay level immediately. Active-low relay inputs can
+  // otherwise float during the serial/NVS/Wi-Fi startup delay and click ON.
+  for (int i = 0; i < NUM_RELAYS; i++) {
+    digitalWrite(RELAY_PINS[i], relayLevel(false));
+    pinMode(RELAY_PINS[i], OUTPUT);
+    relays[i].state = false;
+  }
+
 #if DISABLE_BROWNOUT
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 #endif
@@ -409,38 +471,82 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
+  // Initialize NVS Preferences storage (CRITICAL for persisting state across reboots)
+  prefsReady = prefs.begin("autoroom", false);
+  if (!prefsReady) {
+    Serial.println("[NVS] Warning: Failed to open 'autoroom' preferences namespace!");
+  } else {
+    Serial.println("[NVS] Preferences storage active.");
+  }
+
   pinMode(STATUS_LED, OUTPUT);
-  digitalWrite(STATUS_LED, LOW);
-
   Serial.println("\n=== ESP32 SMART AUTO-ROOM CONTROLLER v2 ===");
+  esp_reset_reason_t rstReason = esp_reset_reason();
+  if (rstReason == ESP_RST_BROWNOUT) {
+    Serial.println("[WARNING] Brownout detected! Your 5V power supply dropped below operating voltage.");
+  } else if (rstReason == ESP_RST_POWERON) {
+    Serial.println("[System] Normal power-on reset.");
+  } else {
+    Serial.printf("[System] Reset reason code: %d\n", (int)rstReason);
+  }
 
-  prefs.begin("autoroom", false);
+  // Read saved boot mode (0=Restore last state, 1=Always start OFF, 2=Always start ON)
+  bootMode = prefsReady ? prefs.getUChar("boot_mode", DEFAULT_BOOT_MODE) : DEFAULT_BOOT_MODE;
+  if (bootMode > BOOT_MODE_ALWAYS_ON) bootMode = DEFAULT_BOOT_MODE;
+  uint32_t savedMask = prefsReady ? prefs.getUInt("relay_mask", 0xFFFFFFFFUL) : 0xFFFFFFFFUL;
+  bool hasSavedMask = (savedMask != 0xFFFFFFFFUL);
+  Serial.printf("[NVS] Saved relay mask: 0x%08lX (%s)\n",
+                (unsigned long)savedMask, hasSavedMask ? "found" : "not found; checking legacy channel keys");
+  Serial.printf("[System] Boot Mode: %s (%d)\n",
+                bootMode == BOOT_MODE_RESTORE ? "Restore Previous State" :
+                (bootMode == BOOT_MODE_ALWAYS_OFF ? "Always Start OFF" : "Always Start ON"),
+                bootMode);
 
-  // Relays: preload the saved level BEFORE enabling the output (no boot glitch)
+  // Apply each saved relay level; pins were initialized to OFF at the start of setup().
   for (int i = 0; i < NUM_RELAYS; i++) {
     char k[16];
     snprintf(k, sizeof(k), "name_%d", i);
-    relays[i].name = prefs.getString(k, DEFAULT_NAMES[i]);
+    relays[i].name = prefsReady ? prefs.getString(k, DEFAULT_NAMES[i]) : String(DEFAULT_NAMES[i]);
 
-    snprintf(k, sizeof(k), "state_%d", i);
-    bool saved = prefs.getBool(k, false);
+    bool initialState = false;
+    if (bootMode == BOOT_MODE_RESTORE) {
+      if (hasSavedMask) {
+        initialState = (savedMask & (1UL << i)) != 0;
+      } else if (prefsReady) {
+        // Migrate installations that used the earlier per-channel state keys.
+        snprintf(k, sizeof(k), "state_%d", i);
+        initialState = prefs.getBool(k, false);
+      }
+    } else if (bootMode == BOOT_MODE_ALWAYS_ON) {
+      initialState = true;
+    } else {
+      initialState = false; // BOOT_MODE_ALWAYS_OFF
+    }
 
-    relays[i].state = saved;
+    relays[i].state = initialState;
     relays[i].timerActive = false;
-    digitalWrite(RELAY_PINS[i], relayLevel(saved));
-    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], relayLevel(initialState));
 
-    pinMode(SWITCH_PINS[i], INPUT_PULLUP);
-    delay(2);
-    relays[i].stableSw = relays[i].lastRawSw = digitalRead(SWITCH_PINS[i]);
-    relays[i].lastSwChange = millis();
+    Serial.printf("[Relay %d: %s] initialized %s\n", i + 1, relays[i].name.c_str(), initialState ? "ON" : "OFF");
+  }
+  // Migrate old state_0..state_3 entries, or save effective forced-mode states.
+  if (bootMode != BOOT_MODE_RESTORE || !hasSavedMask) persistRelayStates();
 
-    Serial.printf("[Relay %d: %s] restored %s\n", i + 1, relays[i].name.c_str(), saved ? "ON" : "OFF");
+  // Physical wall switches: stabilize pull-ups before taking initial baseline reading
+  if (ENABLE_PHYSICAL_SWITCHES) {
+    for (int i = 0; i < NUM_RELAYS; i++) {
+      pinMode(SWITCH_PINS[i], INPUT_PULLUP);
+    }
+    delay(50); // Give internal pull-ups time to charge capacitance on switch lines
+    for (int i = 0; i < NUM_RELAYS; i++) {
+      relays[i].stableSw = digitalRead(SWITCH_PINS[i]);
+      relays[i].swCounter = 0;
+    }
   }
 
   // Wi-Fi credentials: flash overrides defaults
-  cfgSsid = prefs.getString("wifi_ssid", "");
-  cfgPass = prefs.getString("wifi_pass", "");
+  cfgSsid = prefsReady ? prefs.getString("wifi_ssid", "") : "";
+  cfgPass = prefsReady ? prefs.getString("wifi_pass", "") : "";
   if (cfgSsid.length() == 0 && strlen(DEFAULT_WIFI_SSID) > 0 &&
       strcmp(DEFAULT_WIFI_SSID, "YOUR_WIFI_NAME") != 0) {
     cfgSsid = DEFAULT_WIFI_SSID;
@@ -460,12 +566,13 @@ void setup() {
   }
 
   server.on("/", HTTP_GET, handleRoot);
-  server.on("/api/status", HTTP_GET, handleStatus);
-  server.on("/api/relay",  HTTP_POST, handleRelayControl);
-  server.on("/api/master", HTTP_POST, handleMasterControl);
-  server.on("/api/rename", HTTP_POST, handleRename);
-  server.on("/api/timer",  HTTP_POST, handleTimer);
-  server.on("/api/wifi",   HTTP_POST, handleWifiConfig);
+  server.on("/api/status",   HTTP_GET,  handleStatus);
+  server.on("/api/relay",    HTTP_POST, handleRelayControl);
+  server.on("/api/bootmode", HTTP_POST, handleBootMode);
+  server.on("/api/master",   HTTP_POST, handleMasterControl);
+  server.on("/api/rename",   HTTP_POST, handleRename);
+  server.on("/api/timer",    HTTP_POST, handleTimer);
+  server.on("/api/wifi",     HTTP_POST, handleWifiConfig);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("[Server] Ready.");
@@ -478,7 +585,6 @@ void loop() {
   server.handleClient();
   checkPhysicalSwitches();
   checkTimers();
-  flushStateIfNeeded();
 
   static uint32_t lastWifiCheck = 0;
   if (millis() - lastWifiCheck > 2000) {
